@@ -40,13 +40,21 @@ export function formatDateDisplay(dateInput?: string | Date | null): string {
   }
 
   if (typeof dateInput === 'string') {
-    // If it's already in DD/MM/YYYY or DD/MM/YYYY, HH:MM...
+    // If it's already in DD/MM/YYYY or MM/DD/YYYY
     const trimmed = dateInput.trim();
     const ddmmyyyyMatch = trimmed.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
     if (ddmmyyyyMatch) {
-      const day = ddmmyyyyMatch[1].padStart(2, '0');
-      const month = ddmmyyyyMatch[2].padStart(2, '0');
+      let n1 = parseInt(ddmmyyyyMatch[1], 10);
+      let n2 = parseInt(ddmmyyyyMatch[2], 10);
       const year = ddmmyyyyMatch[3];
+      // If second part > 12 and first part <= 12, it was formatted in US MM/DD/YYYY locale
+      if (n2 > 12 && n1 <= 12) {
+        const tmp = n1;
+        n1 = n2;
+        n2 = tmp;
+      }
+      const day = String(n1).padStart(2, '0');
+      const month = String(n2).padStart(2, '0');
       return `${day}/${month}/${year}`;
     }
 
@@ -74,8 +82,8 @@ export function formatDateDisplay(dateInput?: string | Date | null): string {
 
 /**
  * Normalizes any timestamp, date string, or Date object into standard "YYYY-MM-DD" format.
- * Accurately prioritizes DD/MM/YYYY formats (e.g. "06/10/2026, ...") so that day and month
- * are never swapped by JavaScript's US locale date parsing defaults.
+ * Accurately prioritizes DD/MM/YYYY formats (e.g. "06/10/2026, ...") while also detecting
+ * US locale MM/DD/YYYY when the second number exceeds 12.
  */
 export function normalizeDateToYyyyMmDd(dateInput?: string | Date | number | null): string {
   if (!dateInput) return '';
@@ -111,12 +119,19 @@ export function normalizeDateToYyyyMmDd(dateInput?: string | Date | number | nul
     }
   }
 
-  // 1. Matches DD/MM/YYYY or DD-MM-YYYY (e.g. "06/10/2026, 03:45:12 PM", "06/10/2026", "6/10/2026")
+  // 1. Matches DD/MM/YYYY or DD-MM-YYYY (or MM/DD/YYYY if second segment > 12)
   const ddmmyyyyMatch = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
   if (ddmmyyyyMatch) {
-    const day = ddmmyyyyMatch[1].padStart(2, '0');
-    const month = ddmmyyyyMatch[2].padStart(2, '0');
+    let n1 = parseInt(ddmmyyyyMatch[1], 10);
+    let n2 = parseInt(ddmmyyyyMatch[2], 10);
     const year = ddmmyyyyMatch[3];
+    if (n2 > 12 && n1 <= 12) {
+      const tmp = n1;
+      n1 = n2;
+      n2 = tmp;
+    }
+    const day = String(n1).padStart(2, '0');
+    const month = String(n2).padStart(2, '0');
     return `${year}-${month}-${day}`;
   }
 

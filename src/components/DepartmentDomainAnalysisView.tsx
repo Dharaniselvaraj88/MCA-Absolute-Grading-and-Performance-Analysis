@@ -8,6 +8,7 @@ import {
   downloadDomainWiseDepartmentPdfReport,
   calculateGrade
 } from '../utils/exportUtils';
+import { normalizeSubmissionsList } from '../utils/studentDataNormalizer';
 import {
   BarChart,
   Bar,
@@ -62,10 +63,11 @@ const DOMAINS: { id: SectionId; name: string; shortCode: string; color: string; 
 ];
 
 export const DepartmentDomainAnalysisView: React.FC<DepartmentDomainAnalysisViewProps> = ({
-  submissions,
+  submissions: rawSubmissions,
   onViewStudentReport,
   compactMode = false
 }) => {
+  const submissions = useMemo(() => normalizeSubmissionsList(rawSubmissions || []), [rawSubmissions]);
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedDeptFilter, setSelectedDeptFilter] = useState('ALL');
   const [sortBy, setSortBy] = useState<
@@ -85,6 +87,22 @@ export const DepartmentDomainAnalysisView: React.FC<DepartmentDomainAnalysisView
   const departmentsList = useMemo(() => {
     return Array.from(new Set(submissions.map((s) => s.student?.department || 'Unassigned'))).sort();
   }, [submissions]);
+
+  // Filtered individual student submissions matching searchTerm and selectedDeptFilter
+  const filteredStudentSubmissions = useMemo(() => {
+    return submissions.filter((s) => {
+      const dept = s.student?.department || 'Unassigned';
+      if (selectedDeptFilter !== 'ALL' && dept !== selectedDeptFilter) return false;
+      if (searchTerm.trim()) {
+        const q = searchTerm.toLowerCase();
+        const matchDept = dept.toLowerCase().includes(q);
+        const matchName = (s.student?.name || '').toLowerCase().includes(q);
+        const matchReg = (s.student?.registerNo || '').toLowerCase().includes(q);
+        if (!matchDept && !matchName && !matchReg) return false;
+      }
+      return true;
+    });
+  }, [submissions, selectedDeptFilter, searchTerm]);
 
   // Filter and sort departments
   const filteredDepartments = useMemo(() => {
@@ -749,6 +767,99 @@ export const DepartmentDomainAnalysisView: React.FC<DepartmentDomainAnalysisView
                   </tr>
                 </tfoot>
               )}
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* INDIVIDUAL EVALUATED STUDENTS PERFORMANCE ROSTER */}
+      {filteredStudentSubmissions.length > 0 && (
+        <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+          <div className="px-4 py-3 bg-slate-800 text-white flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-700">
+            <div className="flex items-center gap-2">
+              <Users className="w-4 h-4 text-cyan-400" />
+              <h3 className="text-xs font-extrabold uppercase tracking-wider">
+                Evaluated Student Submissions — Individual Performance Analysis
+              </h3>
+            </div>
+            <span className="px-2.5 py-0.5 rounded-full text-[11px] font-mono font-bold bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 self-start sm:self-auto">
+              Showing {filteredStudentSubmissions.length} of {submissions.length} Submitted Student{submissions.length === 1 ? '' : 's'}
+            </span>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs border-collapse">
+              <thead>
+                <tr className="bg-slate-100 text-slate-800 border-b border-slate-200 font-bold text-[11px] uppercase tracking-wider">
+                  <th className="py-2.5 px-3 text-center w-12">S.No</th>
+                  <th className="py-2.5 px-3">Register Number</th>
+                  <th className="py-2.5 px-3">Student Name</th>
+                  <th className="py-2.5 px-3">Department</th>
+                  <th className="py-2.5 px-2.5 text-center text-blue-700">LIM (/10)</th>
+                  <th className="py-2.5 px-2.5 text-center text-emerald-700">DIFF (/10)</th>
+                  <th className="py-2.5 px-2.5 text-center text-purple-700">INT (/10)</th>
+                  <th className="py-2.5 px-2.5 text-center text-amber-700">P&amp;S (/10)</th>
+                  <th className="py-2.5 px-2.5 text-center text-pink-700">MAT (/10)</th>
+                  <th className="py-2.5 px-3 text-center bg-slate-200/70">Total (/50)</th>
+                  <th className="py-2.5 px-3 text-center">Grade</th>
+                  <th className="py-2.5 px-3 text-center">Action</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-200 text-slate-700">
+                {filteredStudentSubmissions.map((sub, sIdx) => {
+                  const sec = sub.report?.sectionScores;
+                  const cScore = sec?.calculus?.score ?? 0;
+                  const pScore = sec?.probability?.score ?? 0;
+                  const nScore = sec?.numberSystem?.score ?? 0;
+                  const tScore = sec?.trigonometry?.score ?? 0;
+                  const sScore = sec?.statistics?.score ?? 0;
+                  const total = sub.report?.overallScore ?? (cScore + pScore + nScore + tScore + sScore);
+                  const pct = sub.report?.overallPercentage ?? Math.round((total / 50) * 100);
+                  const gradeObj = calculateGrade(pct);
+
+                  return (
+                    <tr key={`${sub.id}-${sIdx}`} className="hover:bg-slate-50 transition-colors">
+                      <td className="py-2.5 px-3 text-center font-mono text-slate-500 font-bold">{sIdx + 1}</td>
+                      <td className="py-2.5 px-3 font-mono font-bold text-blue-600">
+                        {sub.student?.registerNo || '-'}
+                      </td>
+                      <td className="py-2.5 px-3 font-semibold text-slate-900">{sub.student?.name || '-'}</td>
+                      <td className="py-2.5 px-3 text-slate-700">{sub.student?.department || '-'}</td>
+                      <td className="py-2.5 px-2.5 text-center font-mono font-bold text-blue-700">{cScore}</td>
+                      <td className="py-2.5 px-2.5 text-center font-mono font-bold text-emerald-700">{pScore}</td>
+                      <td className="py-2.5 px-2.5 text-center font-mono font-bold text-purple-700">{nScore}</td>
+                      <td className="py-2.5 px-2.5 text-center font-mono font-bold text-amber-700">{tScore}</td>
+                      <td className="py-2.5 px-2.5 text-center font-mono font-bold text-pink-700">{sScore}</td>
+                      <td className="py-2.5 px-3 text-center font-mono font-black text-slate-900 bg-slate-50">
+                        {total} <span className="text-[10px] text-slate-500">({pct}%)</span>
+                      </td>
+                      <td className="py-2.5 px-3 text-center">
+                        <span
+                          className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            gradeObj.grade === 'A'
+                              ? 'bg-emerald-100 text-emerald-800'
+                              : gradeObj.grade === 'B'
+                              ? 'bg-blue-100 text-blue-800'
+                              : 'bg-amber-100 text-amber-800'
+                          }`}
+                        >
+                          Grade {gradeObj.grade}
+                        </span>
+                      </td>
+                      <td className="py-2.5 px-3 text-center">
+                        {onViewStudentReport && (
+                          <button
+                            type="button"
+                            onClick={() => onViewStudentReport(sub)}
+                            className="px-2.5 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded text-[11px] font-bold transition-colors cursor-pointer"
+                          >
+                            View Report
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
             </table>
           </div>
         </div>

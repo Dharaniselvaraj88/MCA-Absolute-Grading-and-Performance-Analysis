@@ -319,9 +319,11 @@ export interface AssessmentTestConfig {
   levelDistribution: QuestionLevelDistribution;
   programmes: string[];
   enrolledStudents: EnrolledStudent[];
-  status: 'draft' | 'active' | 'archived';
+  status: 'draft' | 'active' | 'inactive' | 'archived';
   createdAt: string;
   updatedAt?: string;
+  activatedAt?: string;
+  deactivatedAt?: string;
   createdBy?: string;
 }
 
@@ -336,6 +338,8 @@ export interface ActiveStudentSession {
   finishedAt?: number;
   deviceId?: string;
   deviceInfo?: string;
+  testId?: string;
+  testCode?: string;
   status: 'active' | 'completed' | 'terminated' | 'released';
 }
 

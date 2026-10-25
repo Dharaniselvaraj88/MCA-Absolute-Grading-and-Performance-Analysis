@@ -100,6 +100,8 @@ export const AuthGate: React.FC<AuthGateProps> = ({
       const live = tests.find(t => t.status === 'active');
       if (live) {
         setActiveTest(live);
+      } else if (tests.length > 0) {
+        setActiveTest({ ...tests[0], status: 'inactive' });
       }
       setConfiguredDepts(getConfiguredDepartments());
     });
@@ -270,8 +272,8 @@ export const AuthGate: React.FC<AuthGateProps> = ({
     e.preventDefault();
     setErrorMsg('');
 
-    if (isStudentLoginLocked) {
-      setErrorMsg('⛔ STUDENT LOGIN IS LOCKED BY ADMIN: Student assessment portal access is currently disabled by Examination Administration.');
+    if (isStudentLoginLocked || activeTest.status !== 'active') {
+      setErrorMsg('⛔ ASSESSMENT INACTIVE / ENDED: This assessment test is currently deactivated. Students cannot take the test right now.');
       return;
     }
 
@@ -309,34 +311,25 @@ export const AuthGate: React.FC<AuthGateProps> = ({
     }
 
     const trimmedRegNo = registerNo.trim().toUpperCase();
+    const enteredPin = accessKey.trim();
+    const configuredStudentPin = (studentAccessPin || 'cit@123').trim();
 
-    // 1. STRICT CANDIDATE ROSTER VALIDATION (Register No, Name, Department, and Access PIN)
-    const rosterValidation = validateStudentLoginAgainstRoster({
-      registerNo: trimmedRegNo,
-      name: name.trim(),
-      department: department.trim(),
-      accessPin: accessKey.trim(),
-      activeTest,
-      testPin: studentAccessPin
-    });
-
-    if (!rosterValidation.isValid) {
-      const failReason = rosterValidation.error || 'Student credentials failed roster validation.';
+    // Validate ONLY the Student Access PIN
+    if (enteredPin !== configuredStudentPin) {
+      const failReason = 'Invalid Student Access PIN. Please enter the correct Access PIN.';
       setErrorMsg(failReason);
       saveSecurityLogToFirestore({
         id: `sec_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
         timestamp: new Date().toLocaleString(),
         eventType: 'INVALID_STUDENT_PIN_ATTEMPT',
         severity: 'HIGH',
-        details: `Candidate Roster Verification Failed: ${failReason}. Register: "${trimmedRegNo}", Name: "${name.trim()}", Dept: "${department.trim()}".`,
+        details: `Invalid Student Access PIN attempt. Register: "${trimmedRegNo}", Name: "${name.trim()}", Dept: "${department.trim()}".`,
         userRegNo: trimmedRegNo,
         userName: name.trim() || 'Unknown Student',
         userRole: 'student'
       });
       return;
     }
-
-    const enrolledRecord = rosterValidation.matchedStudent || lookupEnrolledStudent(trimmedRegNo);
 
     // Check if there is an active saved session authorized for this student (Feature 3: Resume after exit)
     let isResumingAuthorizedSession = false;
@@ -535,13 +528,9 @@ export const AuthGate: React.FC<AuthGateProps> = ({
     }
 
     const candidatePayload: StudentInfo = {
-      name: (name.trim() && name.trim().toUpperCase() !== 'STUDENT CANDIDATE')
-        ? name.trim().toUpperCase()
-        : (DCS_SPECIFIC_STUDENTS[trimmedRegNo]?.name || name.trim().toUpperCase()),
+      name: name.trim().toUpperCase(),
       registerNo: trimmedRegNo,
-      department: (DCS_SPECIFIC_STUDENTS[trimmedRegNo] || trimmedRegNo.includes('DCS'))
-        ? 'MSc Decision and Computing Sciences'
-        : department,
+      department: department.trim(),
       accessPasscode: accessKey.trim(),
       authenticatedAt: new Date().toISOString(),
       deviceId: localDeviceId || (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `dev_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`)
@@ -733,9 +722,22 @@ export const AuthGate: React.FC<AuthGateProps> = ({
           
           <div className="relative z-10 space-y-5">
             <div>
-              <div className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-blue-100 text-blue-800 text-xs font-bold rounded-full mb-2">
-                <Sparkles className="w-3.5 h-3.5 text-blue-600" />
-                Active Examination Specification
+              <div className="flex items-center gap-2 flex-wrap mb-2">
+                <div className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-blue-100 text-blue-800 text-xs font-bold rounded-full">
+                  <Sparkles className="w-3.5 h-3.5 text-blue-600" />
+                  Examination Specification
+                </div>
+                {!isStudentLoginLocked && activeTest.status === 'active' ? (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-emerald-100 text-emerald-800 border border-emerald-300 text-xs font-bold rounded-full">
+                    <span className="w-2 h-2 rounded-full bg-emerald-600 animate-pulse" />
+                    Status: Active (Live)
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-rose-100 text-rose-800 border border-rose-300 text-xs font-bold rounded-full">
+                    <Lock className="w-3 h-3 text-rose-600" />
+                    Status: Deactivated / Inactive
+                  </span>
+                )}
               </div>
               <h2 className="text-xl sm:text-2xl font-extrabold text-slate-900 font-sans tracking-tight">
                 {activeTest.title || 'Mathematics Competency Assessment'}
@@ -1023,7 +1025,6 @@ export const AuthGate: React.FC<AuthGateProps> = ({
                     <label className="block text-xs font-bold text-slate-700">
                       Register Number / User ID <span className="text-red-500">*</span>
                     </label>
-                    <span className="text-[10px] text-slate-500 font-medium">Checked with roster</span>
                   </div>
                   <div className="relative">
                     <CreditCard className="w-4 h-4 absolute left-3 top-3 text-slate-400" />
@@ -1032,39 +1033,10 @@ export const AuthGate: React.FC<AuthGateProps> = ({
                       required
                       placeholder="e.g. 26CS001, 26IT001 or 717624102001"
                       value={registerNo}
-                      onChange={(e) => {
-                        const val = e.target.value;
-                        setRegisterNo(val);
-                        const upper = val.trim().toUpperCase();
-                        const matched = findStudentInRoster(upper, activeTest);
-                        if (matched) {
-                          if (matched.name) setName(matched.name.toUpperCase());
-                          if (matched.programme) setDepartment(matched.programme);
-                          // Student Access PIN is strictly NOT auto-filled or displayed: student must enter it manually
-                        } else if (DCS_SPECIFIC_STUDENTS[upper]) {
-                          setDepartment('MSc Decision and Computing Sciences');
-                          if (!name || name === 'STUDENT CANDIDATE') {
-                            setName(DCS_SPECIFIC_STUDENTS[upper].name);
-                          }
-                        } else if (upper.includes('DCS')) {
-                          setDepartment('MSc Decision and Computing Sciences');
-                        }
-                      }}
+                      onChange={(e) => setRegisterNo(e.target.value)}
                       className="w-full pl-9 pr-3 py-2.5 bg-slate-50 border border-slate-300 rounded-lg text-slate-900 text-sm font-mono focus:outline-none focus:border-blue-600 focus:bg-white focus:ring-2 focus:ring-blue-100 uppercase placeholder-slate-400 font-bold"
                     />
                   </div>
-                  {/* Real-time Roster Match Feedback */}
-                  {registeredCandidate ? (
-                    <div className="mt-1.5 p-2 bg-emerald-50 border border-emerald-300 rounded-lg text-xs text-emerald-900 flex items-center gap-1.5 shadow-2xs animate-in fade-in">
-                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-                      <span className="truncate">Verified on candidate roster: <strong>{registeredCandidate.name}</strong> • <em>{registeredCandidate.programme}</em></span>
-                    </div>
-                  ) : registerNo.trim().length >= 3 ? (
-                    <div className="mt-1.5 p-1.5 bg-amber-50 border border-amber-300 rounded-lg text-[11px] text-amber-900 flex items-center gap-1.5 shadow-2xs animate-in fade-in">
-                      <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
-                      <span>Register Number must match an enrolled candidate in the uploaded student name list.</span>
-                    </div>
-                  ) : null}
                 </div>
 
                 {/* 2. Student Name */}
@@ -1073,11 +1045,6 @@ export const AuthGate: React.FC<AuthGateProps> = ({
                     <label className="block text-xs font-bold text-slate-700">
                       Student Name (Initial at the end) <span className="text-red-500">*</span>
                     </label>
-                    {registeredCandidate && isStudentNameMatching(name, registeredCandidate.name) && (
-                      <span className="text-[10px] font-bold text-emerald-700 bg-emerald-100 px-1.5 py-0.2 rounded flex items-center gap-1">
-                        <Check className="w-3 h-3" /> Name Matches Roster
-                      </span>
-                    )}
                   </div>
                   <div className="relative">
                     <User className="w-4 h-4 absolute left-3 top-3 text-slate-400" />
@@ -1090,12 +1057,6 @@ export const AuthGate: React.FC<AuthGateProps> = ({
                       className="w-full pl-9 pr-3 py-2.5 bg-slate-50 border border-slate-300 rounded-lg text-slate-900 text-sm focus:outline-none focus:border-blue-600 focus:bg-white focus:ring-2 focus:ring-blue-100 font-sans uppercase placeholder-slate-400 font-medium"
                     />
                   </div>
-                  {registeredCandidate && name.trim() && !isStudentNameMatching(name, registeredCandidate.name) && (
-                    <div className="mt-1 text-[11px] font-semibold text-rose-600 flex items-center gap-1">
-                      <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-                      <span>Name mismatch: Registered roster name is <strong>{registeredCandidate.name}</strong>.</span>
-                    </div>
-                  )}
                 </div>
 
                 {/* 3. Department / Program */}
@@ -1104,11 +1065,6 @@ export const AuthGate: React.FC<AuthGateProps> = ({
                     <label className="block text-xs font-bold text-slate-700">
                       Department / Program <span className="text-red-500">*</span>
                     </label>
-                    {registeredCandidate && isStudentDepartmentMatching(department, registeredCandidate.programme) && (
-                      <span className="text-[10px] font-bold text-emerald-700 bg-emerald-100 px-1.5 py-0.2 rounded flex items-center gap-1">
-                        <Check className="w-3 h-3" /> Dept Matches Roster
-                      </span>
-                    )}
                   </div>
                   <div className="relative">
                     <Building2 className="w-4 h-4 absolute left-3 top-3 text-slate-400 pointer-events-none" />
@@ -1124,12 +1080,6 @@ export const AuthGate: React.FC<AuthGateProps> = ({
                       ))}
                     </select>
                   </div>
-                  {registeredCandidate && !isStudentDepartmentMatching(department, registeredCandidate.programme) && (
-                    <div className="mt-1 text-[11px] font-semibold text-rose-600 flex items-center gap-1">
-                      <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-                      <span>Dept mismatch: Candidate is registered under <strong>{registeredCandidate.programme}</strong>.</span>
-                    </div>
-                  )}
                 </div>
 
                 {/* 4. Institutional Key / Access PIN */}

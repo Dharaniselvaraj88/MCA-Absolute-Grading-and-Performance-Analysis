@@ -39,7 +39,8 @@ import {
   subscribeActiveSessions,
   clearStaleActiveSessions,
   resumeStudentSessionInFirestore,
-  saveAssessmentSavepointToFirestore
+  saveAssessmentSavepointToFirestore,
+  subscribeAssessmentTests
 } from './lib/firebase';
 import { Header } from './components/Header';
 import { AuthGate } from './components/AuthGate';
@@ -354,15 +355,22 @@ export default function App() {
     };
   }, []);
 
-  // Sync active test configuration in real time when changed by admin
+  // Sync active test configuration in real time when changed by admin (both local and Firestore)
   useEffect(() => {
     const handleActiveTestChange = () => {
       const current = getActiveAssessmentTest();
       setActiveAssessmentTest(current);
     };
+    const unsubscribeTests = subscribeAssessmentTests((tests) => {
+      if (Array.isArray(tests) && tests.length > 0) {
+        const current = getActiveAssessmentTest(tests);
+        setActiveAssessmentTest(current);
+      }
+    });
     window.addEventListener('cit_active_test_updated', handleActiveTestChange);
     window.addEventListener('storage', handleActiveTestChange);
     return () => {
+      unsubscribeTests();
       window.removeEventListener('cit_active_test_updated', handleActiveTestChange);
       window.removeEventListener('storage', handleActiveTestChange);
     };
@@ -636,6 +644,8 @@ export default function App() {
       startedAt: testStartedAtRef.current,
       totalDurationSeconds: testTotalDurationRef.current,
       savedAt: Date.now(),
+      testConfigId: activeAssessmentTest?.id,
+      testCode: activeAssessmentTest?.testCode,
       status: 'in-progress',
       attemptCount: attemptCount || 1,
       maxAttempts: 3
@@ -677,6 +687,8 @@ export default function App() {
         totalDurationSeconds: testTotalDurationRef.current,
         attemptCount,
         maxAttempts: 3,
+        testConfigId: activeAssessmentTest?.id,
+        testCode: activeAssessmentTest?.testCode,
         status: 'in-progress',
         savedAt: Date.now()
       };
@@ -764,6 +776,8 @@ export default function App() {
       startedAt: Date.now(),
       lastHeartbeat: Date.now(),
       deviceId,
+      testId: activeAssessmentTest?.id,
+      testCode: activeAssessmentTest?.testCode,
       status: 'active'
     }).catch((err) => console.warn('Active session initial registration warning:', err));
 
@@ -832,13 +846,15 @@ export default function App() {
     setResponses(activeResponses);
     setReport(generatedReport);
 
+    const safeRegId = (sessionStudent.registerNo || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+    const currentActiveTest = getActiveAssessmentTest();
     const newSavedSub: SavedSubmission = {
-      id: `SUB-${Date.now()}`,
+      id: safeRegId ? `SUB-${Date.now()}-${safeRegId}` : `SUB-${Date.now()}`,
       student: sessionStudent,
       submittedAt: getCurrentTimestamp(),
       report: generatedReport,
-      testId: activeAssessmentTest?.id,
-      testCode: activeAssessmentTest?.testCode || 'CIT-MATH-2026-01'
+      testId: currentActiveTest?.id || activeAssessmentTest?.id,
+      testCode: currentActiveTest?.testCode || activeAssessmentTest?.testCode || 'CIT-MATH-2026-01'
     };
 
     // 1. Persist to localStorage backup
@@ -1367,13 +1383,14 @@ export default function App() {
 
     setReport(generatedReport);
 
+    const safeRegId = (currentStudent.registerNo || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
     const newSavedSub: SavedSubmission = {
-      id: `SUB-${Date.now()}`,
+      id: safeRegId ? `SUB-${Date.now()}-${safeRegId}` : `SUB-${Date.now()}`,
       student: currentStudent,
       submittedAt: getCurrentTimestamp(),
       report: generatedReport,
-      testId: activeAssessmentTest?.id,
-      testCode: activeAssessmentTest?.testCode || 'CIT-MATH-2026-01'
+      testId: currentActiveTest?.id || activeAssessmentTest?.id,
+      testCode: currentActiveTest?.testCode || activeAssessmentTest?.testCode || 'CIT-MATH-2026-01'
     };
 
     // 1. Immediately persist to localStorage backup
@@ -1498,6 +1515,8 @@ export default function App() {
         }
       },
       isLockedOut: true,
+      testId: currentActiveTest?.id || activeAssessmentTest?.id,
+      testCode: currentActiveTest?.testCode || activeAssessmentTest?.testCode || 'CIT-MATH-2026-01',
       securityViolation: {
         isViolated: true,
         reason: violationReasonText,

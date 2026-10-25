@@ -821,10 +821,37 @@ export function getDefaultAssessmentTest(): AssessmentTestConfig {
 
 /**
  * Retrieves the active Assessment Test configuration.
+ * Prioritizes providedTests and CIT_ASSESSMENT_TESTS so deactivated tests never appear active.
  */
-export function getActiveAssessmentTest(): AssessmentTestConfig {
+export function getActiveAssessmentTest(providedTests?: AssessmentTestConfig[]): AssessmentTestConfig {
   try {
+    if (Array.isArray(providedTests) && providedTests.length > 0) {
+      const activeFromProvided = providedTests.find(t => t.status === 'active');
+      if (activeFromProvided) {
+        return activeFromProvided;
+      }
+      return { ...providedTests[0], status: 'inactive' };
+    }
+
     if (typeof localStorage !== 'undefined') {
+      const testsStr = localStorage.getItem('CIT_ASSESSMENT_TESTS');
+      if (testsStr) {
+        const tests: AssessmentTestConfig[] = JSON.parse(testsStr);
+        if (Array.isArray(tests) && tests.length > 0) {
+          const active = tests.find(t => t.status === 'active');
+          if (active) {
+            if (Array.isArray(active.programmes) && !active.programmes.some(p => p.toLowerCase().includes('vlsi'))) {
+              active.programmes.push('B.E. Electronics Engineering (VLSI Design and Technology)');
+            }
+            localStorage.setItem(ACTIVE_TEST_KEY, JSON.stringify(active));
+            return active;
+          }
+          const latestInactive: AssessmentTestConfig = { ...tests[0], status: 'inactive' };
+          localStorage.setItem(ACTIVE_TEST_KEY, JSON.stringify(latestInactive));
+          return latestInactive;
+        }
+      }
+
       const cachedActive = localStorage.getItem(ACTIVE_TEST_KEY);
       if (cachedActive) {
         const parsed: AssessmentTestConfig = JSON.parse(cachedActive);
@@ -834,18 +861,6 @@ export function getActiveAssessmentTest(): AssessmentTestConfig {
             localStorage.setItem(ACTIVE_TEST_KEY, JSON.stringify(parsed));
           }
           return parsed;
-        }
-      }
-      const testsStr = localStorage.getItem('CIT_ASSESSMENT_TESTS');
-      if (testsStr) {
-        const tests: AssessmentTestConfig[] = JSON.parse(testsStr);
-        const active = tests.find(t => t.status === 'active');
-        if (active) {
-          if (Array.isArray(active.programmes) && !active.programmes.some(p => p.toLowerCase().includes('vlsi'))) {
-            active.programmes.push('B.E. Electronics Engineering (VLSI Design and Technology)');
-          }
-          localStorage.setItem(ACTIVE_TEST_KEY, JSON.stringify(active));
-          return active;
         }
       }
     }
@@ -861,7 +876,13 @@ export function getActiveAssessmentTest(): AssessmentTestConfig {
 export function setActiveAssessmentTest(test: AssessmentTestConfig): void {
   try {
     if (typeof localStorage !== 'undefined') {
-      const activatedTest = { ...test, status: 'active' as const };
+      const nowIso = new Date().toISOString();
+      const activatedTest: AssessmentTestConfig = {
+        ...test,
+        status: 'active',
+        activatedAt: test.activatedAt || nowIso,
+        updatedAt: nowIso
+      };
       localStorage.setItem(ACTIVE_TEST_KEY, JSON.stringify(activatedTest));
 
       if (test.enrolledStudents && Array.isArray(test.enrolledStudents) && test.enrolledStudents.length > 0) {
@@ -874,17 +895,57 @@ export function setActiveAssessmentTest(test: AssessmentTestConfig): void {
         const tests: AssessmentTestConfig[] = JSON.parse(testsStr);
         const exists = tests.some(t => t.id === activatedTest.id);
         const updated = exists
-          ? tests.map(t => ({
-              ...t,
-              status: (t.id === activatedTest.id ? 'active' : 'inactive') as 'active' | 'inactive'
-            }))
-          : [...tests.map(t => ({ ...t, status: 'inactive' as const })), activatedTest];
+          ? tests.map(t =>
+              t.id === activatedTest.id
+                ? activatedTest
+                : { ...t, status: 'inactive' as const, deactivatedAt: t.status === 'active' ? nowIso : t.deactivatedAt }
+            )
+          : [activatedTest, ...tests.map(t => ({ ...t, status: 'inactive' as const }))];
         localStorage.setItem('CIT_ASSESSMENT_TESTS', JSON.stringify(updated));
+      } else {
+        localStorage.setItem('CIT_ASSESSMENT_TESTS', JSON.stringify([activatedTest]));
       }
       window.dispatchEvent(new Event('cit_active_test_updated'));
     }
   } catch (e) {
     console.warn('Error setting active test:', e);
+  }
+}
+
+/**
+ * Deactivates / ends an Assessment Test so no student can take the test.
+ */
+export function deactivateAssessmentTest(test: AssessmentTestConfig): void {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const nowIso = new Date().toISOString();
+      const deactivatedTest: AssessmentTestConfig = {
+        ...test,
+        status: 'inactive',
+        deactivatedAt: test.deactivatedAt || nowIso,
+        updatedAt: nowIso
+      };
+      localStorage.setItem(ACTIVE_TEST_KEY, JSON.stringify(deactivatedTest));
+
+      const testsStr = localStorage.getItem('CIT_ASSESSMENT_TESTS');
+      if (testsStr) {
+        const tests: AssessmentTestConfig[] = JSON.parse(testsStr);
+        const exists = tests.some(t => t.id === deactivatedTest.id);
+        const updated = exists
+          ? tests.map(t =>
+              t.id === deactivatedTest.id
+                ? deactivatedTest
+                : { ...t, status: 'inactive' as const }
+            )
+          : [deactivatedTest, ...tests.map(t => ({ ...t, status: 'inactive' as const }))];
+        localStorage.setItem('CIT_ASSESSMENT_TESTS', JSON.stringify(updated));
+      } else {
+        localStorage.setItem('CIT_ASSESSMENT_TESTS', JSON.stringify([deactivatedTest]));
+      }
+      window.dispatchEvent(new Event('cit_active_test_updated'));
+    }
+  } catch (e) {
+    console.warn('Error deactivating test:', e);
   }
 }
 
@@ -1122,36 +1183,8 @@ export function validateStudentLoginAgainstRoster(params: {
     return { isValid: false, error: 'Please enter student Access PIN.' };
   }
 
-  // 1. CHECK REGISTER NUMBER IN CANDIDATE NAME LIST
-  const matched = findStudentInRoster(cleanRegNo, params.activeTest);
-  if (!matched) {
-    return {
-      isValid: false,
-      error: `❌ Register Number / User ID "${cleanRegNo}" is not found in the uploaded candidate name list for this assessment. Please check your Register Number or contact Examination Administration.`
-    };
-  }
-
-  // 2. CHECK CANDIDATE NAME AGAINST ROSTER NAME
-  if (!isStudentNameMatching(cleanName, matched.name)) {
-    return {
-      isValid: false,
-      error: `❌ Candidate Name mismatch: You entered "${cleanName}", but Register Number "${cleanRegNo}" is registered as "${matched.name}" in the candidate name list. Please enter your name exactly as registered.`,
-      matchedStudent: matched
-    };
-  }
-
-  // 3. CHECK DEPARTMENT AGAINST ROSTER DEPARTMENT
-  if (!isStudentDepartmentMatching(cleanDept, matched.programme)) {
-    return {
-      isValid: false,
-      error: `❌ Department mismatch: You selected "${cleanDept}", but candidate "${matched.name}" (${cleanRegNo}) is enrolled under "${matched.programme}". Please select your registered department.`,
-      matchedStudent: matched
-    };
-  }
-
-  // 4. CHECK ACCESS PIN AGAINST ASSIGNED PIN / TEST PIN
+  // Validate ONLY the Access PIN (do not check Register Number, Name, or Department against uploaded student roster)
   const validPins = [
-    matched.assignedPassword,
     params.testPin,
     'cit@123'
   ].filter(Boolean) as string[];
@@ -1160,14 +1193,12 @@ export function validateStudentLoginAgainstRoster(params: {
   if (!isPinValid) {
     return {
       isValid: false,
-      error: `❌ Invalid Access PIN for Register Number "${cleanRegNo}". Please enter the correct Access PIN assigned to your candidate profile.`,
-      matchedStudent: matched
+      error: 'Invalid Student Access PIN. Please enter the correct Access PIN.'
     };
   }
 
   return {
-    isValid: true,
-    matchedStudent: matched
+    isValid: true
   };
 }
 

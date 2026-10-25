@@ -245,13 +245,22 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   const [firestoreFetchStatus, setFirestoreFetchStatus] = useState<string | null>(null);
 
   // Assessment Tests & Candidate Allocation State
-  const [assessmentTests, setAssessmentTests] = useState<AssessmentTestConfig[]>([]);
+  const [assessmentTests, setAssessmentTests] = useState<AssessmentTestConfig[]>(() => {
+    try {
+      const cached = localStorage.getItem('CIT_ASSESSMENT_TESTS');
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch {}
+    return [];
+  });
   const [isNewTestModalOpen, setIsNewTestModalOpen] = useState(false);
   const [isShortcutModalOpen, setIsShortcutModalOpen] = useState(false);
   const [copiedPortalLink, setCopiedPortalLink] = useState<string | null>(null);
 
   // Track students unlocked/activated from the Live Test Dashboard so they immediately show as Active
-  const [activatedLiveStudents, setActivatedLiveStudents] = useState<Record<string, { registerNo: string; name: string; department: string; activatedAt: number }>>(() => {
+  const [activatedLiveStudents, setActivatedLiveStudents] = useState<Record<string, { registerNo: string; name: string; department: string; activatedAt: number; testId?: string; testCode?: string }>>(() => {
     try {
       const raw = localStorage.getItem('CIT_ACTIVATED_LIVE_STUDENTS');
       return raw ? JSON.parse(raw) : {};
@@ -274,6 +283,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
       onResumeStudentSession(student.submission, 'student_login', true);
     }
 
+    const activeTestNow = getActiveAssessmentTest(assessmentTests);
+
     setActivatedLiveStudents((prev) => {
       const updated = {
         ...prev,
@@ -281,7 +292,9 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
           registerNo: regUpper,
           name: student.name,
           department: student.department,
-          activatedAt: Date.now()
+          activatedAt: Date.now(),
+          testId: activeTestNow?.id,
+          testCode: activeTestNow?.testCode
         }
       };
       try {
@@ -314,25 +327,145 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     const unsub = subscribeAssessmentTests((tests) => {
       setAssessmentTests(tests);
     });
-    return () => unsub();
+    const syncLocalTests = () => {
+      try {
+        const cached = localStorage.getItem('CIT_ASSESSMENT_TESTS');
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setAssessmentTests(parsed);
+          }
+        }
+      } catch {}
+    };
+    window.addEventListener('cit_active_test_updated', syncLocalTests);
+    return () => {
+      unsub();
+      window.removeEventListener('cit_active_test_updated', syncLocalTests);
+    };
   }, []);
 
   const handleSaveNewTest = async (testConfig: AssessmentTestConfig) => {
-    await saveAssessmentTestToFirestore(testConfig);
+    const nowIso = new Date().toISOString();
+    const normalizedNewTest: AssessmentTestConfig = {
+      ...testConfig,
+      status: 'active',
+      activatedAt: nowIso,
+      updatedAt: nowIso
+    };
+    const previousActiveTests = assessmentTests.filter(t => t.id !== normalizedNewTest.id && t.status === 'active');
+
     setAssessmentTests((prev) => {
-      const idx = prev.findIndex(t => t.id === testConfig.id);
-      if (idx >= 0) {
-        const next = [...prev];
-        next[idx] = testConfig;
-        return next;
-      }
-      return [testConfig, ...prev];
+      const deactivatedPrev = prev.map(t =>
+        t.id === normalizedNewTest.id
+          ? normalizedNewTest
+          : { ...t, status: 'inactive' as const, deactivatedAt: t.status === 'active' ? nowIso : t.deactivatedAt, updatedAt: nowIso }
+      );
+      const exists = prev.some(t => t.id === normalizedNewTest.id);
+      return exists ? deactivatedPrev : [normalizedNewTest, ...deactivatedPrev];
     });
+
+    if (onToggleStudentLoginLock) {
+      onToggleStudentLoginLock(false);
+    }
+
+    await saveAssessmentTestToFirestore(normalizedNewTest);
+    for (const prevTest of previousActiveTests) {
+      await saveAssessmentTestToFirestore({
+        ...prevTest,
+        status: 'inactive',
+        deactivatedAt: nowIso,
+        updatedAt: nowIso
+      });
+    }
   };
 
   const handleDeleteTest = async (testId: string) => {
     await deleteAssessmentTestFromFirestore(testId);
     setAssessmentTests((prev) => prev.filter(t => t.id !== testId));
+  };
+
+  const handleToggleTestStatus = async (test: AssessmentTestConfig, newStatus: 'active' | 'inactive') => {
+    const nowIso = new Date().toISOString();
+    if (newStatus === 'inactive') {
+      const updatedTest: AssessmentTestConfig = {
+        ...test,
+        status: 'inactive',
+        deactivatedAt: nowIso,
+        updatedAt: nowIso
+      };
+      const otherActiveTests = assessmentTests.filter(t => t.id !== test.id && t.status === 'active');
+
+      // Clear temporary live unlocked cache for the deactivated test
+      setActivatedLiveStudents({});
+      try {
+        localStorage.removeItem('CIT_ACTIVATED_LIVE_STUDENTS');
+      } catch {}
+
+      // Update React state immediately so Live Test Dashboard reflects deactivation right away
+      setAssessmentTests((prev) => {
+        const exists = prev.some(t => t.id === test.id);
+        if (!exists) {
+          return [updatedTest, ...prev.map(t => ({ ...t, status: 'inactive' as const, deactivatedAt: t.deactivatedAt || nowIso, updatedAt: nowIso }))];
+        }
+        return prev.map(t =>
+          t.id === test.id
+            ? updatedTest
+            : { ...t, status: 'inactive' as const, deactivatedAt: t.status === 'active' ? nowIso : t.deactivatedAt, updatedAt: nowIso }
+        );
+      });
+
+      if (onToggleStudentLoginLock) {
+        onToggleStudentLoginLock(true);
+      }
+
+      // Persist status to Firestore database
+      await saveAssessmentTestToFirestore(updatedTest);
+      for (const other of otherActiveTests) {
+        await saveAssessmentTestToFirestore({
+          ...other,
+          status: 'inactive',
+          deactivatedAt: nowIso,
+          updatedAt: nowIso
+        });
+      }
+    } else {
+      const updatedTest: AssessmentTestConfig = {
+        ...test,
+        status: 'active',
+        activatedAt: nowIso,
+        updatedAt: nowIso
+      };
+      const otherActiveTests = assessmentTests.filter(t => t.id !== test.id && t.status === 'active');
+
+      // Update React state immediately so Live Test Dashboard reflects activation right away
+      setAssessmentTests((prev) => {
+        const exists = prev.some(t => t.id === test.id);
+        if (!exists) {
+          return [updatedTest, ...prev.map(t => ({ ...t, status: 'inactive' as const, deactivatedAt: t.status === 'active' ? nowIso : t.deactivatedAt, updatedAt: nowIso }))];
+        }
+        return prev.map(t =>
+          t.id === test.id
+            ? updatedTest
+            : { ...t, status: 'inactive' as const, deactivatedAt: t.status === 'active' ? nowIso : t.deactivatedAt, updatedAt: nowIso }
+        );
+      });
+
+      if (onToggleStudentLoginLock) {
+        onToggleStudentLoginLock(false);
+      }
+
+      // Persist status to Firestore database
+      await saveAssessmentTestToFirestore(updatedTest);
+      for (const other of otherActiveTests) {
+        await saveAssessmentTestToFirestore({
+          ...other,
+          status: 'inactive',
+          deactivatedAt: nowIso,
+          updatedAt: nowIso
+        });
+      }
+    }
   };
 
   // Edit Student Submission Details State
@@ -1852,13 +1985,57 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
 
   // Helper to extract clean test code from a submission
   const getSubmissionTestCode = (sub: SavedSubmission): string => {
-    const raw = sub.testCode || (sub as any).testIdentifier || (sub as any).code;
-    if (raw && String(raw).trim()) return String(raw).trim();
-    if (sub.testId) {
-      const match = assessmentTests.find((t) => t.id === sub.testId);
-      if (match?.testCode && match.testCode.trim()) return match.testCode.trim();
+    const raw = sub.testCode || (sub as any).testIdentifier || (sub as any).code || (sub.report as any)?.testCode;
+    const rawStr = raw ? String(raw).trim() : '';
+    const rawId = sub.testId || (sub as any).testConfigId || (sub.report as any)?.testId;
+
+    // 1. If testId matches a configured test in assessmentTests, use its official testCode
+    if (rawId) {
+      const matchById = assessmentTests.find((t) => t.id === rawId);
+      if (matchById?.testCode && matchById.testCode.trim()) {
+        return matchById.testCode.trim();
+      }
     }
-    return 'CIT-MATH-2026-01';
+
+    // 2. If raw testCode is explicitly present and not the generic fallback (or if no custom tests exist), return it
+    if (rawStr && (rawStr.toUpperCase() !== 'CIT-MATH-2026-01' || assessmentTests.length === 0)) {
+      return rawStr;
+    }
+
+    // 3. For submissions recorded with generic fallback 'CIT-MATH-2026-01' or missing testCode:
+    // Resolve against configured assessmentTests by student roster, submission date, or active/single test
+    const regUpper = (sub.student?.registerNo || '').trim().toUpperCase();
+    if (regUpper && assessmentTests.length > 0) {
+      const matchByRoster = assessmentTests.find((t) =>
+        (t.enrolledStudents || []).some((stu) => (stu.registerNo || '').trim().toUpperCase() === regUpper)
+      );
+      if (matchByRoster?.testCode && matchByRoster.testCode.trim()) {
+        return matchByRoster.testCode.trim();
+      }
+    }
+
+    const subDate = normalizeDateToYyyyMmDd(sub.submittedAt || sub.report?.testTimestamp || '');
+    if (subDate && assessmentTests.length > 0) {
+      const matchByDate = assessmentTests.find((t) => {
+        const createdDate = normalizeDateToYyyyMmDd(t.createdAt || '');
+        const activatedDate = normalizeDateToYyyyMmDd(t.activatedAt || '');
+        return (createdDate && createdDate === subDate) || (activatedDate && activatedDate === subDate);
+      });
+      if (matchByDate?.testCode && matchByDate.testCode.trim()) {
+        return matchByDate.testCode.trim();
+      }
+    }
+
+    const activeConfigured = assessmentTests.find((t) => t.status === 'active');
+    if (activeConfigured?.testCode && activeConfigured.testCode.trim()) {
+      return activeConfigured.testCode.trim();
+    }
+
+    if (assessmentTests.length === 1 && assessmentTests[0]?.testCode?.trim()) {
+      return assessmentTests[0].testCode.trim();
+    }
+
+    return rawStr || 'CIT-MATH-2026-01';
   };
 
   // Check if submission matches target test code / identifier (supports 'ALL' for all tests)
@@ -1866,8 +2043,43 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     if (!targetCode) return false;
     const target = targetCode.toUpperCase().trim();
     if (target === 'ALL' || target === 'ALL TESTS' || target === 'ALL_TESTS') return true;
+
     const subCode = getSubmissionTestCode(sub).toUpperCase().trim();
-    return subCode === target;
+    if (subCode === target) return true;
+
+    const rawCode = String(sub.testCode || (sub as any).testIdentifier || (sub as any).code || (sub.report as any)?.testCode || '').toUpperCase().trim();
+    const rawId = String(sub.testId || (sub as any).testConfigId || (sub.report as any)?.testId || '').toUpperCase().trim();
+    if (rawCode === target || rawId === target) return true;
+
+    // Match against configured test in assessmentTests by testCode, id, or title
+    const matchedTest = assessmentTests.find(
+      (t) =>
+        (t.testCode || '').trim().toUpperCase() === target ||
+        (t.id || '').trim().toUpperCase() === target ||
+        (t.title || '').trim().toUpperCase() === target
+    );
+
+    if (matchedTest) {
+      const matchedIdUpper = (matchedTest.id || '').trim().toUpperCase();
+      const matchedCodeUpper = (matchedTest.testCode || '').trim().toUpperCase();
+      if (rawId && rawId === matchedIdUpper) return true;
+      if (rawCode && rawCode === matchedCodeUpper) return true;
+
+      // If submission had fallback/missing testCode & testId (e.g. 'CIT-MATH-2026-01' / 'default_cit_math_2026' or undefined),
+      // and does not explicitly belong to a different custom test in assessmentTests, match it for that date's test!
+      const isFallbackCode = !rawCode || rawCode === 'CIT-MATH-2026-01';
+      const isFallbackId = !rawId || rawId === 'DEFAULT_CIT_MATH_2026' || rawId === 'CIT-DEFAULT-TEST-2026';
+      if (isFallbackCode && isFallbackId) {
+        return true;
+      }
+    }
+
+    // If user selected default 'CIT-MATH-2026-01' and submission had no explicit testCode
+    if (target === 'CIT-MATH-2026-01' && (!rawCode || rawCode === 'CIT-MATH-2026-01')) {
+      return true;
+    }
+
+    return false;
   };
 
   // Check if submission date matches target calendar date
@@ -1945,13 +2157,20 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   // Strict Gate: Both Date AND Test Code / Identifier must be chosen for data to load
   const isDateAndTestSelected = Boolean(selectedDate && selectedTestCode);
 
+  // Actively refresh/fetch submissions from Firestore when both Date and Test Code/ID are selected
+  useEffect(() => {
+    if (selectedDate && selectedTestCode && onRefreshSubmissions) {
+      onRefreshSubmissions();
+    }
+  }, [selectedDate, selectedTestCode]);
+
   // Submissions filtered strictly by both selected assessment date AND test code/identifier
   const submissionsForSelectedDate = useMemo(() => {
     if (!isDateAndTestSelected) return [];
     return submissions.filter(
       (sub) => matchesDateFilter(sub, selectedDate) && matchesTestCodeFilter(sub, selectedTestCode)
     );
-  }, [submissions, selectedDate, selectedTestCode, isDateAndTestSelected]);
+  }, [submissions, selectedDate, selectedTestCode, isDateAndTestSelected, assessmentTests]);
 
   // Submissions filtered for Departmentwise & Gradewise Report Generator
   // Strictly scoped to the selected date and test code cohort!
@@ -5213,6 +5432,20 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
           const lockedSet = new Set((lockedStudentRegNos || []).map((r) => r.trim().toUpperCase()).filter(Boolean));
           const pinScheduleCheck = studentPinSchedule?.isEnabled ? isStudentPinActive(studentPinSchedule) : { isActive: true };
 
+          // Strictly determine the currently ACTIVE assessment test.
+          // Inactive tests must NEVER be displayed in the Live Test Dashboard.
+          const allConfiguredTests = assessmentTests.length > 0 ? assessmentTests : [getActiveAssessmentTest()];
+          const activeLiveTest = !isStudentLoginLocked
+            ? allConfiguredTests.find((t) => t.status === 'active') || null
+            : null;
+
+          const isTestLiveNow = Boolean(
+            activeLiveTest &&
+              activeLiveTest.status === 'active' &&
+              !isStudentLoginLocked &&
+              pinScheduleCheck.isActive
+          );
+
           const liveMap = new Map<
             string,
             {
@@ -5224,102 +5457,193 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
             }
           >();
 
-          // 1. Active sessions from Firestore
-          (activeSessions || []).forEach((sess) => {
-            const regUpper = (sess.registerNo || '').trim().toUpperCase();
-            if (!regUpper) return;
-            const isLocked = lockedSet.has(regUpper);
-            liveMap.set(regUpper, {
-              registerNo: regUpper,
-              name: sess.studentName || 'Candidate',
-              department: sess.department || 'B.E. / B.Tech.',
-              status: isLocked ? 'Locked' : 'Active'
+          if (isTestLiveNow && activeLiveTest) {
+            const activeTestId = activeLiveTest.id;
+            const activeTestCode = (activeLiveTest.testCode || '').trim().toUpperCase();
+            const activeTestCreatedMs = activeLiveTest.createdAt ? Date.parse(activeLiveTest.createdAt) : 0;
+
+            const inactiveTests = allConfiguredTests.filter((t) => t.id !== activeTestId && t.status !== 'active');
+            const inactiveTestIds = new Set(inactiveTests.map((t) => t.id).filter(Boolean));
+            const inactiveTestCodes = new Set(
+              inactiveTests
+                .map((t) => (t.testCode || '').trim().toUpperCase())
+                .filter((code) => code && code !== activeTestCode)
+            );
+
+            // Helper to verify that a session or submission belongs to the currently active test
+            // and NOT to any deactivated / inactive test.
+            const belongsToActiveTest = (
+              recordTestId?: string,
+              recordTestCode?: string,
+              recordTimeMs?: number,
+              isLockedRecord: boolean = false,
+              recordDateYyyyMmDd?: string
+            ): boolean => {
+              const cleanId = recordTestId ? recordTestId.trim() : '';
+              const cleanCodeUpper = recordTestCode ? recordTestCode.trim().toUpperCase() : '';
+
+              // Explicitly exclude anything recorded under a deactivated test ID or test Code
+              if (cleanId && inactiveTestIds.has(cleanId)) return false;
+              if (cleanCodeUpper && inactiveTestCodes.has(cleanCodeUpper)) return false;
+
+              // Explicit match with the currently active test
+              if (cleanId && cleanId === activeTestId) return true;
+              if (cleanCodeUpper && cleanCodeUpper === activeTestCode) return true;
+
+              const isDefaultFallbackId =
+                !cleanId || cleanId === 'default_cit_math_2026' || cleanId === 'cit-default-test-2026';
+              const isDefaultFallbackCode =
+                !cleanCodeUpper || cleanCodeUpper === 'CIT-MATH-2026-01';
+
+              // If it has a custom non-default testId or testCode that does NOT match activeLiveTest, exclude it
+              if (!isDefaultFallbackId || !isDefaultFallbackCode) {
+                return false;
+              }
+
+              // For locked records without explicit activeTestId/activeTestCode:
+              // Strictly exclude if there are inactive tests or if created before active test
+              if (isLockedRecord) {
+                if (inactiveTests.length > 0) {
+                  return false;
+                }
+                if (activeTestCreatedMs > 0 && recordTimeMs && recordTimeMs < activeTestCreatedMs) {
+                  return false;
+                }
+                return true;
+              }
+
+              // For active sessions or completed submissions with fallback/missing testId/testCode:
+              // Include if it occurred today or after the active test was created
+              if (recordDateYyyyMmDd && recordDateYyyyMmDd === todayYyyyMmDd) {
+                return true;
+              }
+              if (activeTestCreatedMs > 0 && recordTimeMs && recordTimeMs >= activeTestCreatedMs) {
+                return true;
+              }
+              if (!recordDateYyyyMmDd && (!activeTestCreatedMs || !recordTimeMs)) {
+                return true;
+              }
+              return false;
+            };
+
+            // 1. Active sessions from Firestore belonging to the active test
+            (activeSessions || []).forEach((sess) => {
+              const regUpper = (sess.registerNo || '').trim().toUpperCase();
+              if (!regUpper) return;
+              const isLocked = lockedSet.has(regUpper);
+              const sessTimeMs = sess.startedAt || sess.loginTimestamp || 0;
+              const sessDate = sessTimeMs ? normalizeDateToYyyyMmDd(sessTimeMs) : todayYyyyMmDd;
+              if (!belongsToActiveTest(sess.testId, sess.testCode, sessTimeMs, isLocked, sessDate)) {
+                return;
+              }
+              liveMap.set(regUpper, {
+                registerNo: regUpper,
+                name: sess.studentName || 'Candidate',
+                department: sess.department || 'B.E. / B.Tech.',
+                status: isLocked ? 'Locked' : 'Active'
+              });
             });
-          });
 
-          // 2. Local active assessment session on this browser
-          try {
-            const localRaw = localStorage.getItem('CIT_ACTIVE_ASSESSMENT_SESSION');
-            if (localRaw) {
-              const parsed = JSON.parse(localRaw);
-              if (parsed?.student?.registerNo && parsed?.status !== 'completed') {
-                const regUpper = parsed.student.registerNo.trim().toUpperCase();
-                if (regUpper && !liveMap.has(regUpper)) {
+            // 2. Local active assessment session on this browser belonging to the active test
+            try {
+              const localRaw = localStorage.getItem('CIT_ACTIVE_ASSESSMENT_SESSION');
+              if (localRaw) {
+                const parsed = JSON.parse(localRaw);
+                if (parsed?.student?.registerNo && parsed?.status !== 'completed') {
+                  const regUpper = parsed.student.registerNo.trim().toUpperCase();
                   const isLocked = lockedSet.has(regUpper);
-                  liveMap.set(regUpper, {
-                    registerNo: regUpper,
-                    name: parsed.student.name || 'Candidate',
-                    department: parsed.student.department || 'B.E. / B.Tech.',
-                    status: isLocked ? 'Locked' : 'Active'
+                  const sessTimeMs = parsed.startedAt || parsed.savedAt || 0;
+                  const sessDate = sessTimeMs ? normalizeDateToYyyyMmDd(sessTimeMs) : todayYyyyMmDd;
+                  if (
+                    regUpper &&
+                    !liveMap.has(regUpper) &&
+                    belongsToActiveTest(parsed.testConfigId, parsed.testCode, sessTimeMs, isLocked, sessDate)
+                  ) {
+                    liveMap.set(regUpper, {
+                      registerNo: regUpper,
+                      name: parsed.student.name || 'Candidate',
+                      department: parsed.student.department || 'B.E. / B.Tech.',
+                      status: isLocked ? 'Locked' : 'Active'
+                    });
+                  }
+                }
+              }
+            } catch {}
+
+            // 3. Students activated by Admin/Faculty from Locked state in the active test
+            Object.values(activatedLiveStudents).forEach((act) => {
+              const regUpper = (act.registerNo || '').trim().toUpperCase();
+              if (!regUpper || lockedSet.has(regUpper)) return;
+              const actDate = act.activatedAt ? normalizeDateToYyyyMmDd(act.activatedAt) : todayYyyyMmDd;
+              if (!belongsToActiveTest(act.testId, act.testCode, act.activatedAt, false, actDate)) return;
+              if (!liveMap.has(regUpper)) {
+                liveMap.set(regUpper, {
+                  registerNo: regUpper,
+                  name: act.name || 'Candidate',
+                  department: act.department || 'B.E. / B.Tech.',
+                  status: 'Active'
+                });
+              }
+            });
+
+            // 4. Submissions (Completed or Locked) belonging to the active test
+            submissions.forEach((sub) => {
+              if (!sub?.student?.registerNo) return;
+              const subTimeStr = sub.submittedAt || sub.report?.testTimestamp || '';
+              const subDate = normalizeDateToYyyyMmDd(subTimeStr);
+              const regUpper = sub.student.registerNo.trim().toUpperCase();
+              const isLockRecordId = Boolean(sub.id?.startsWith('SUB-LOCK-'));
+              const isSubLocked = Boolean(sub.isLockedOut || sub.securityViolation?.isViolated || lockedSet.has(regUpper));
+
+              const idMatch = sub.id?.match(/^SUB-(?:LOCK-)?(\d{10,15})/);
+              const idTimestamp = idMatch ? Number(idMatch[1]) : 0;
+              const recordTimeMs = idTimestamp || (subTimeStr ? Date.parse(subTimeStr) || 0 : 0);
+
+              if (!belongsToActiveTest(sub.testId, sub.testCode, recordTimeMs, isSubLocked || isLockRecordId, subDate)) {
+                return;
+              }
+
+              const matchesActiveExplicitly =
+                (sub.testId && sub.testId.trim() === activeTestId) ||
+                (sub.testCode && sub.testCode.trim().toUpperCase() === activeTestCode);
+
+              if (subDate === todayYyyyMmDd || isSubLocked || matchesActiveExplicitly) {
+                const existing = liveMap.get(regUpper);
+
+                // If this record is an old SUB-LOCK- record that was unlocked by Admin (!isSubLocked),
+                // do not mark the student as Completed from a lockout record.
+                if (isLockRecordId && !isSubLocked) {
+                  return;
+                }
+
+                // If the student already has a Completed submission in liveMap, do not overwrite it with an older Lock record
+                if (existing && existing.status === 'Completed' && isSubLocked) {
+                  return;
+                }
+
+                // If the student is currently in liveMap as Active and this is a genuine Completed submission (!isSubLocked):
+                // Only keep them as Active if their active session was started AFTER this submission timestamp
+                if (existing && existing.status === 'Active' && !isSubLocked) {
+                  const newerActiveSession = (activeSessions || []).some((s) => {
+                    if ((s.registerNo || '').trim().toUpperCase() !== regUpper) return false;
+                    const sessStart = s.startedAt || s.loginTimestamp || 0;
+                    return recordTimeMs > 0 && sessStart > recordTimeMs + 5000;
                   });
+                  if (newerActiveSession) {
+                    return;
+                  }
                 }
+
+                liveMap.set(regUpper, {
+                  registerNo: regUpper,
+                  name: sub.student.name || existing?.name || 'Candidate',
+                  department: sub.student.department || existing?.department || 'B.E. / B.Tech.',
+                  status: isSubLocked ? 'Locked' : 'Completed',
+                  submission: sub
+                });
               }
-            }
-          } catch {}
-
-          // 3. Students activated by Admin/Faculty from Locked state
-          Object.values(activatedLiveStudents).forEach((act) => {
-            const regUpper = (act.registerNo || '').trim().toUpperCase();
-            if (!regUpper || lockedSet.has(regUpper)) return;
-            if (!liveMap.has(regUpper)) {
-              liveMap.set(regUpper, {
-                registerNo: regUpper,
-                name: act.name || 'Candidate',
-                department: act.department || 'B.E. / B.Tech.',
-                status: 'Active'
-              });
-            }
-          });
-
-          // 4. Today's submissions (Completed or Locked during the current test)
-          submissions.forEach((sub) => {
-            if (!sub?.student?.registerNo) return;
-            const subDate = normalizeDateToYyyyMmDd(sub.submittedAt || sub.report?.testTimestamp || '');
-            const regUpper = sub.student.registerNo.trim().toUpperCase();
-            const isSubLocked = Boolean(sub.isLockedOut || sub.securityViolation?.isViolated || lockedSet.has(regUpper));
-
-            if (subDate === todayYyyyMmDd || isSubLocked) {
-              const existing = liveMap.get(regUpper);
-              if (existing && existing.status === 'Active' && !isSubLocked) {
-                const actRecord = activatedLiveStudents[regUpper];
-                if (actRecord && sub.id?.startsWith('SUB-LOCK-')) {
-                  return;
-                }
-                const inFirestoreActive = (activeSessions || []).some(
-                  (s) => (s.registerNo || '').trim().toUpperCase() === regUpper
-                );
-                if (inFirestoreActive) {
-                  return;
-                }
-              }
-
-              liveMap.set(regUpper, {
-                registerNo: regUpper,
-                name: sub.student.name || existing?.name || 'Candidate',
-                department: sub.student.department || existing?.department || 'B.E. / B.Tech.',
-                status: isSubLocked ? 'Locked' : 'Completed',
-                submission: sub
-              });
-            }
-          });
-
-          // 5. Any remaining lockedStudentRegNos not yet in liveMap
-          lockedSet.forEach((regUpper) => {
-            if (!liveMap.has(regUpper)) {
-              const matchedSub = submissions.find((s) => s?.student?.registerNo?.trim().toUpperCase() === regUpper);
-              const rosterMatch = !matchedSub ? findStudentInRoster(regUpper, getActiveAssessmentTest(assessmentTests)) : null;
-              liveMap.set(regUpper, {
-                registerNo: regUpper,
-                name: matchedSub?.student?.name || rosterMatch?.name || 'Candidate',
-                department: matchedSub?.student?.department || rosterMatch?.programme || 'B.E. / B.Tech.',
-                status: 'Locked',
-                submission: matchedSub
-              });
-            } else {
-              const entry = liveMap.get(regUpper)!;
-              entry.status = 'Locked';
-            }
-          });
+            });
+          }
 
           // Sort: Active at the top (1), Locked in the middle (2), Completed at the bottom (3)
           const statusPriority: Record<'Active' | 'Locked' | 'Completed', number> = {
@@ -5338,23 +5662,24 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
           const lockedCount = liveStudentsList.filter((s) => s.status === 'Locked').length;
           const completedCount = liveStudentsList.filter((s) => s.status === 'Completed').length;
 
-          const isTestLiveNow =
-            !isStudentLoginLocked &&
-            (pinScheduleCheck.isActive || (activeSessions && activeSessions.length > 0)) &&
-            liveStudentsList.length > 0;
-
           return (
             <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-md space-y-4 break-inside-avoid">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-slate-200 gap-3">
                 <div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
                     <Radio className={`w-5 h-5 ${isTestLiveNow ? 'text-emerald-600 animate-pulse' : 'text-slate-400'}`} />
                     <h2 className="text-lg font-bold font-sans text-slate-900">
                       Live Test Dashboard
                     </h2>
+                    {isTestLiveNow && activeLiveTest && (
+                      <span className="px-2.5 py-0.5 bg-emerald-100 text-emerald-800 border border-emerald-300 rounded-full text-[11px] font-bold flex items-center gap-1.5">
+                        <span className="w-2 h-2 rounded-full bg-emerald-600 animate-pulse" />
+                        LIVE: {activeLiveTest.title} ({activeLiveTest.testCode})
+                      </span>
+                    )}
                   </div>
                   <p className="text-xs text-slate-600 mt-0.5">
-                    Real-time status of students taking the assessment (Active students listed at top, Completed at bottom).
+                    Real-time status of students taking the active assessment (Active students listed at top, Completed at bottom).
                   </p>
                 </div>
 
@@ -5391,64 +5716,80 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-200 bg-white">
-                      {liveStudentsList.map((stu, idx) => (
-                        <tr
-                          key={stu.registerNo}
-                          className={`hover:bg-slate-50 transition-colors ${
-                            stu.status === 'Active'
-                              ? 'bg-emerald-50/30'
-                              : stu.status === 'Locked'
-                              ? 'bg-rose-50/40'
-                              : ''
-                          }`}
-                        >
-                          <td className="p-3 text-center font-mono text-slate-500 font-semibold">
-                            {idx + 1}
-                          </td>
-                          <td className="p-3 font-mono font-bold text-blue-600">
-                            {stu.registerNo}
-                          </td>
-                          <td className="p-3 font-bold text-slate-900">
-                            {stu.name}
-                          </td>
-                          <td className="p-3 text-slate-700">
-                            {stu.department}
-                          </td>
-                          <td className="p-3 text-center">
-                            <div className="inline-flex items-center justify-center gap-2 flex-wrap">
-                              {stu.status === 'Active' && (
-                                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-emerald-100 text-emerald-800 border border-emerald-300 rounded-full font-bold text-[11px]">
-                                  <span className="w-2 h-2 rounded-full bg-emerald-600 animate-pulse" />
-                                  Active
-                                </span>
-                              )}
-                              {stu.status === 'Completed' && (
-                                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-blue-100 text-blue-800 border border-blue-300 rounded-full font-bold text-[11px]">
-                                  <CheckCircle2 className="w-3.5 h-3.5 text-blue-600" />
-                                  Completed
-                                </span>
-                              )}
-                              {stu.status === 'Locked' && (
-                                <>
-                                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-rose-100 text-rose-800 border border-rose-300 rounded-full font-bold text-[11px]">
-                                    <Lock className="w-3.5 h-3.5 text-rose-600" />
-                                    Locked
+                      {liveStudentsList.length > 0 ? (
+                        liveStudentsList.map((stu, idx) => (
+                          <tr
+                            key={stu.registerNo}
+                            className={`hover:bg-slate-50 transition-colors ${
+                              stu.status === 'Active'
+                                ? 'bg-emerald-50/30'
+                                : stu.status === 'Locked'
+                                ? 'bg-rose-50/40'
+                                : ''
+                            }`}
+                          >
+                            <td className="p-3 text-center font-mono text-slate-500 font-semibold">
+                              {idx + 1}
+                            </td>
+                            <td className="p-3 font-mono font-bold text-blue-600">
+                              {stu.registerNo}
+                            </td>
+                            <td className="p-3 font-bold text-slate-900">
+                              {stu.name}
+                            </td>
+                            <td className="p-3 text-slate-700">
+                              {stu.department}
+                            </td>
+                            <td className="p-3 text-center">
+                              <div className="inline-flex items-center justify-center gap-2 flex-wrap">
+                                {stu.status === 'Active' && (
+                                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-emerald-100 text-emerald-800 border border-emerald-300 rounded-full font-bold text-[11px]">
+                                    <span className="w-2 h-2 rounded-full bg-emerald-600 animate-pulse" />
+                                    Active
                                   </span>
-                                  <button
-                                    type="button"
-                                    onClick={() => handleActivateLockedStudent(stu)}
-                                    className="px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-md font-bold text-[11px] flex items-center gap-1 transition-all cursor-pointer shadow-xs"
-                                    title={`Activate student ${stu.registerNo} (${stu.name})`}
-                                  >
-                                    <KeyRound className="w-3.5 h-3.5" />
-                                    <span>Activate</span>
-                                  </button>
-                                </>
-                              )}
+                                )}
+                                {stu.status === 'Completed' && (
+                                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-blue-100 text-blue-800 border border-blue-300 rounded-full font-bold text-[11px]">
+                                    <CheckCircle2 className="w-3.5 h-3.5 text-blue-600" />
+                                    Completed
+                                  </span>
+                                )}
+                                {stu.status === 'Locked' && (
+                                  <>
+                                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-rose-100 text-rose-800 border border-rose-300 rounded-full font-bold text-[11px]">
+                                      <Lock className="w-3.5 h-3.5 text-rose-600" />
+                                      Locked
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleActivateLockedStudent(stu)}
+                                      className="px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-md font-bold text-[11px] flex items-center gap-1 transition-all cursor-pointer shadow-xs"
+                                      title={`Activate student ${stu.registerNo} (${stu.name})`}
+                                    >
+                                      <KeyRound className="w-3.5 h-3.5" />
+                                      <span>Activate</span>
+                                    </button>
+                                  </>
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        ))
+                      ) : (
+                        <tr>
+                          <td colSpan={5} className="p-8 text-center text-slate-600">
+                            <div className="flex flex-col items-center justify-center gap-1.5">
+                              <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-full text-xs font-bold">
+                                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                                Assessment "{activeLiveTest?.title}" ({activeLiveTest?.testCode}) is Active &amp; Live
+                              </span>
+                              <p className="text-xs text-slate-500 mt-1">
+                                No students have joined or submitted for this active test yet. Candidates will appear here in real time as they start the test.
+                              </p>
                             </div>
                           </td>
                         </tr>
-                      ))}
+                      )}
                     </tbody>
                   </table>
                 </div>
@@ -5798,6 +6139,115 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
               </div>
             </div>
 
+          </div>
+
+          {/* SUBMITTED STUDENTS PERFORMANCE ANALYSIS ROSTER */}
+          <div className="pt-4 border-t border-slate-200 space-y-3">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                  <Users className="w-4 h-4 text-indigo-600" />
+                  <span>Submitted Students Performance Analysis ({ (() => {
+                    const list = submissions.filter((s) => {
+                      const matchDept = analyticsDept === 'ALL' || (s.student.department || 'General') === analyticsDept;
+                      const matchDate = !analyticsDate || matchesDateFilter(s, analyticsDate);
+                      return matchDept && matchDate;
+                    });
+                    return list.length;
+                  })() } of {totalEvaluated} Students)</span>
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Individual performance details of all students who have submitted the assessment.
+                </p>
+              </div>
+            </div>
+
+            {(() => {
+              const analyticsStudentList = submissions.filter((s) => {
+                const matchDept = analyticsDept === 'ALL' || (s.student.department || 'General') === analyticsDept;
+                const matchDate = !analyticsDate || matchesDateFilter(s, analyticsDate);
+                return matchDept && matchDate;
+              });
+
+              if (analyticsStudentList.length === 0) {
+                return (
+                  <div className="py-8 text-center text-slate-400 text-xs bg-slate-50 border border-dashed border-slate-200 rounded-xl">
+                    No submitted student records available for the selected filter.
+                  </div>
+                );
+              }
+
+              return (
+                <div className="overflow-x-auto border border-slate-200 rounded-xl max-h-96 overflow-y-auto">
+                  <table className="w-full text-left text-xs font-sans border-collapse">
+                    <thead className="sticky top-0 z-10 bg-slate-100 text-slate-700 border-b border-slate-200 font-bold uppercase tracking-wider text-[11px]">
+                      <tr>
+                        <th className="p-3 w-12 text-center">S.No</th>
+                        <th className="p-3">Register Number</th>
+                        <th className="p-3">Student Name</th>
+                        <th className="p-3">Department</th>
+                        <th className="p-3 text-center">Score (/50)</th>
+                        <th className="p-3 text-center">Grade</th>
+                        <th className="p-3">Submitted At</th>
+                        <th className="p-3 text-right">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-200 bg-white">
+                      {analyticsStudentList.map((sub, idx) => {
+                        const score = sub.report?.overallScore ?? 0;
+                        const maxScore = sub.report?.maxScore ?? 50;
+                        const pct = sub.report?.overallPercentage ?? Math.round((score / (maxScore || 50)) * 100);
+                        const g = calculateGrade(pct);
+                        const isLocked = Boolean(sub.isLockedOut || sub.securityViolation?.isViolated);
+
+                        return (
+                          <tr key={`${sub.id}-${idx}`} className="hover:bg-slate-50 transition-colors">
+                            <td className="p-3 text-center font-mono text-slate-500 font-semibold">{idx + 1}</td>
+                            <td className="p-3 font-mono font-bold text-blue-600">{sub.student?.registerNo || '-'}</td>
+                            <td className="p-3 font-bold text-slate-900">{sub.student?.name || '-'}</td>
+                            <td className="p-3 text-slate-700">{sub.student?.department || '-'}</td>
+                            <td className="p-3 text-center font-mono font-bold text-slate-900">
+                              {score} / {maxScore} <span className="text-[10px] text-slate-500">({pct}%)</span>
+                            </td>
+                            <td className="p-3 text-center">
+                              {isLocked ? (
+                                <span className="px-2 py-0.5 bg-rose-100 text-rose-800 border border-rose-300 rounded font-bold text-[11px]">
+                                  Locked
+                                </span>
+                              ) : (
+                                <span
+                                  className={`px-2 py-0.5 rounded font-bold text-[11px] border ${
+                                    g.grade === 'A'
+                                      ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
+                                      : g.grade === 'B'
+                                      ? 'bg-blue-50 text-blue-800 border-blue-300'
+                                      : 'bg-amber-50 text-amber-800 border-amber-300'
+                                  }`}
+                                >
+                                  Grade {g.grade}
+                                </span>
+                              )}
+                            </td>
+                            <td className="p-3 font-mono text-[11px] text-slate-600">
+                              {sub.submittedAt || sub.report?.testTimestamp || '-'}
+                            </td>
+                            <td className="p-3 text-right">
+                              <button
+                                type="button"
+                                onClick={() => onSelectSubmission(sub)}
+                                className="px-2.5 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded text-[11px] font-bold transition-colors cursor-pointer"
+                              >
+                                View Report
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              );
+            })()}
           </div>
           </div>
         </div>
@@ -7540,6 +7990,8 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
             tests={assessmentTests}
             onOpenNewTestModal={() => setIsNewTestModalOpen(true)}
             onDeleteTest={handleDeleteTest}
+            isStudentLoginLocked={isStudentLoginLocked}
+            onToggleTestStatus={handleToggleTestStatus}
           />
         )}
 

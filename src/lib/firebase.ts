@@ -246,6 +246,9 @@ function normalizeSubmission(raw: any, docId: string): SavedSubmission {
     detailedItemAnalysis: rawReport?.detailedItemAnalysis || []
   };
 
+  const rawTestId = raw?.testId || raw?.testConfigId || raw?.report?.testId;
+  const rawTestCode = raw?.testCode || raw?.testIdentifier || raw?.code || raw?.report?.testCode;
+
   return {
     id,
     student,
@@ -254,6 +257,8 @@ function normalizeSubmission(raw: any, docId: string): SavedSubmission {
     isLockedOut: !!raw?.isLockedOut,
     securityViolation: raw?.securityViolation,
     feedback: raw?.feedback,
+    ...(rawTestId ? { testId: String(rawTestId).trim() } : {}),
+    ...(rawTestCode ? { testCode: String(rawTestCode).trim() } : {}),
     createdAt: raw?.createdAt || (typeof submittedAt === 'string' ? submittedAt : new Date().toISOString())
   };
 }
@@ -1147,23 +1152,46 @@ export async function clearAllFeedbackFromFirestore(): Promise<{ deletedCount: n
 
 export async function saveAssessmentTestToFirestore(test: AssessmentTestConfig): Promise<void> {
   const path = `tests/${test.id}`;
-  
+  const nowIso = new Date().toISOString();
+  const normalizedTest: AssessmentTestConfig = {
+    ...test,
+    updatedAt: nowIso,
+    ...(test.status === 'active'
+      ? { activatedAt: test.activatedAt || nowIso }
+      : { deactivatedAt: test.deactivatedAt || nowIso })
+  };
+
+  let otherTestsToDeactivate: AssessmentTestConfig[] = [];
+
   // Save to local storage cache immediately
   try {
     const cachedRaw = localStorage.getItem('CIT_ASSESSMENT_TESTS');
     const existingList: AssessmentTestConfig[] = cachedRaw ? JSON.parse(cachedRaw) : [];
-    const index = existingList.findIndex(t => t.id === test.id);
+    const index = existingList.findIndex(t => t.id === normalizedTest.id);
     if (index >= 0) {
-      existingList[index] = test;
+      existingList[index] = normalizedTest;
     } else {
-      existingList.unshift(test);
+      existingList.unshift(normalizedTest);
     }
-    // If this test is active, mark others as archived and update active test config
-    if (test.status === 'active') {
+    // If this test is active, mark others as inactive and update active test config
+    if (normalizedTest.status === 'active') {
       existingList.forEach(t => {
-        if (t.id !== test.id && t.status === 'active') t.status = 'archived';
+        if (t.id !== normalizedTest.id && t.status === 'active') {
+          t.status = 'inactive';
+          t.deactivatedAt = nowIso;
+          t.updatedAt = nowIso;
+          otherTestsToDeactivate.push({ ...t });
+        }
       });
-      localStorage.setItem('CIT_ACTIVE_TEST_CONFIG', JSON.stringify(test));
+      localStorage.setItem('CIT_ACTIVE_TEST_CONFIG', JSON.stringify(normalizedTest));
+      window.dispatchEvent(new Event('cit_active_test_updated'));
+    } else {
+      const remainingActive = existingList.find(t => t.id !== normalizedTest.id && t.status === 'active');
+      if (remainingActive) {
+        localStorage.setItem('CIT_ACTIVE_TEST_CONFIG', JSON.stringify(remainingActive));
+      } else {
+        localStorage.setItem('CIT_ACTIVE_TEST_CONFIG', JSON.stringify({ ...normalizedTest, status: 'inactive' }));
+      }
       window.dispatchEvent(new Event('cit_active_test_updated'));
     }
     localStorage.setItem('CIT_ASSESSMENT_TESTS', JSON.stringify(existingList));
@@ -1171,8 +1199,8 @@ export async function saveAssessmentTestToFirestore(test: AssessmentTestConfig):
     // Also update enrolled students lookup cache
     const existingEnrolledRaw = localStorage.getItem('CIT_ENROLLED_STUDENTS');
     let allEnrolled: EnrolledStudent[] = existingEnrolledRaw ? JSON.parse(existingEnrolledRaw) : [];
-    if (test.enrolledStudents && Array.isArray(test.enrolledStudents)) {
-      test.enrolledStudents.forEach(st => {
+    if (normalizedTest.enrolledStudents && Array.isArray(normalizedTest.enrolledStudents)) {
+      normalizedTest.enrolledStudents.forEach(st => {
         const idx = allEnrolled.findIndex(e => e.userId.toLowerCase() === st.userId.toLowerCase());
         if (idx >= 0) {
           allEnrolled[idx] = st;
@@ -1188,11 +1216,14 @@ export async function saveAssessmentTestToFirestore(test: AssessmentTestConfig):
 
   // Persist to Firestore
   try {
-    const docRef = doc(db, 'tests', test.id);
-    await setDoc(docRef, {
-      ...test,
-      updatedAt: new Date().toISOString()
-    });
+    const docRef = doc(db, 'tests', normalizedTest.id);
+    await setDoc(docRef, normalizedTest, { merge: true });
+
+    // Ensure any other active tests in local list are also marked inactive in Firestore
+    for (const other of otherTestsToDeactivate) {
+      const otherRef = doc(db, 'tests', other.id);
+      await setDoc(otherRef, { ...other, status: 'inactive', deactivatedAt: nowIso, updatedAt: nowIso }, { merge: true });
+    }
   } catch (err) {
     console.warn('Failed to save assessment test to Firestore (using local storage):', err);
     handleFirestoreError(err, OperationType.WRITE, path);
@@ -1220,18 +1251,18 @@ export function subscribeAssessmentTests(callback: (tests: AssessmentTestConfig[
             if (liveActive) {
               const currentActiveRaw = localStorage.getItem('CIT_ACTIVE_TEST_CONFIG');
               const currentActive = currentActiveRaw ? JSON.parse(currentActiveRaw) : null;
-              if (!currentActive || currentActive.id !== liveActive.id || currentActive.updatedAt !== liveActive.updatedAt) {
+              if (!currentActive || currentActive.id !== liveActive.id || currentActive.status !== 'active' || currentActive.updatedAt !== liveActive.updatedAt) {
                 localStorage.setItem('CIT_ACTIVE_TEST_CONFIG', JSON.stringify(liveActive));
                 window.dispatchEvent(new Event('cit_active_test_updated'));
               }
+            } else {
+              const latestInactive = { ...tests[0], status: 'inactive' as const };
+              localStorage.setItem('CIT_ACTIVE_TEST_CONFIG', JSON.stringify(latestInactive));
+              window.dispatchEvent(new Event('cit_active_test_updated'));
             }
           } catch {}
           callback(tests);
         } else {
-          try {
-            localStorage.removeItem('CIT_ASSESSMENT_TESTS');
-            localStorage.removeItem('CIT_ACTIVE_TEST_CONFIG');
-          } catch {}
           callback([]);
         }
       },
